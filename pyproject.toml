@@ -22,6 +22,8 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "ruff>=0.16.7",
+    "ty>=0.0.80",
 ]
 
 [project.optional-dependencies]
