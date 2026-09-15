@@ -18,14 +18,17 @@ They are marked xfail and flip to passing as you implement each function.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 from rapidfuzz import fuzz, utils
 
 from agent import db
-from agent.auth import AuthContext, can_cancel_order, permission_denied
+from agent.auth import AuthContext, can_cancel_order, can_view_order, permission_denied
+from agent.config import load_facts
 from agent.helpcenter import load_policy_docs
 from agent.killswitch import kill_switch
+from seed.eligibility import effective_return_window_days
 
 MAX_SEARCH_LIMIT = 25
 DEFAULT_ORDER_LIMIT = 20
@@ -285,3 +288,110 @@ def find_order(ctx: AuthContext, query: str) -> dict[str, Any]:
             if len(orders) == FIND_ORDER_LIMIT:
                 break
     return {"ok": True, "orders": orders}
+
+
+def _return_record_inconsistency(order: db.Order) -> str | None:
+    """Name the defect that makes a return deadline impossible to trust, or None.
+
+    Two seeded data-quality cases land here: an order marked delivered with no
+    delivery date (dq-order-missing-delivery-date) and an order whose shipment
+    date follows its delivery date (dq-order-reversed-chronology). Both mean the
+    timeline is wrong, so the tool reports the defect instead of computing a
+    deadline from it.
+    """
+    if order.status == "delivered" and order.delivered_at is None:
+        return f"order #{order.id} is marked delivered but records no delivery date"
+    if (
+        order.shipped_at is not None
+        and order.delivered_at is not None
+        and order.shipped_at > order.delivered_at
+    ):
+        return (
+            f"order #{order.id} records shipment on {order.shipped_at}, "
+            f"after delivery on {order.delivered_at}"
+        )
+    return None
+
+
+def check_return_eligibility(ctx: AuthContext, order_id: int) -> dict[str, Any]:
+    """Report the return deadline for one order, with the dates it was computed from.
+
+    Args:
+        ctx: The caller's auth context.
+        order_id: The order to check.
+
+    Returns:
+        On success: {"ok": True, "order_id": int, "status": str,
+        "delivered_at": str | None, "as_of": str, "return_window_days": int,
+        "store_return_window_days": int | None, "return_deadline": str | None,
+        "days_remaining": int | None, "eligible": bool, "reason_code": str,
+        "policy_ids": list[str]}, plus "inconsistency" when the record's dates
+        contradict each other. Dates are ISO strings and `days_remaining` is
+        negative once the window has passed.
+
+        `reason_code` is one of "within_window", "window_expired",
+        "not_delivered", "delivery_in_future", or "inconsistent_record".
+
+        {"ok": False, "error": "not_found", ...} for an unknown order and
+        {"ok": False, "error": "permission_denied", ...} for an order outside
+        the caller's scope, checked before any order detail is returned.
+    """
+    facts = load_facts()
+    with db.connection() as conn:
+        order = db.get_order(conn, order_id)
+        if order is None:
+            return {
+                "ok": False,
+                "error": "not_found",
+                "reason": f"no order #{order_id}",
+            }
+        if not can_view_order(ctx, order.user_id, order.store_id):
+            return permission_denied(
+                f"role '{ctx.role}' (user {ctx.user_id}) may not view order #{order_id}"
+            )
+        as_of = db.world_asof(conn)
+        store = db.get_store(conn, order.store_id)
+    override = store.return_window_days_override if store else None
+    window_days = effective_return_window_days(facts["return_window_days"], override)
+    policy_ids = ["cw-returns"]
+    if store is not None and override is not None:
+        store_policy_id = f"store-{store.slug}-policy"
+        if any(doc.policy_id == store_policy_id for doc in load_policy_docs()):
+            policy_ids.append(store_policy_id)
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "order_id": order.id,
+        "status": order.status,
+        "delivered_at": order.delivered_at.isoformat() if order.delivered_at else None,
+        "as_of": as_of.isoformat(),
+        "return_window_days": window_days,
+        "store_return_window_days": override,
+        "return_deadline": None,
+        "days_remaining": None,
+        "eligible": order.refund_eligible,
+        "reason_code": "",
+        "policy_ids": policy_ids,
+    }
+
+    inconsistency = _return_record_inconsistency(order)
+    if inconsistency is not None:
+        result["eligible"] = False
+        result["reason_code"] = "inconsistent_record"
+        result["inconsistency"] = inconsistency
+        return result
+
+    if order.status != "delivered" or order.delivered_at is None:
+        result["reason_code"] = "not_delivered"
+        return result
+
+    deadline = order.delivered_at + timedelta(days=window_days)
+    result["return_deadline"] = deadline.isoformat()
+    result["days_remaining"] = (deadline - as_of).days
+    if order.delivered_at > as_of:
+        result["reason_code"] = "delivery_in_future"
+    elif as_of <= deadline:
+        result["reason_code"] = "within_window"
+    else:
+        result["reason_code"] = "window_expired"
+    return result
