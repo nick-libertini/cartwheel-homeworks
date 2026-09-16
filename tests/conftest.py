@@ -18,6 +18,23 @@ import pytest
 from seed.generate import generate_world
 
 
+@pytest.fixture(autouse=True)
+def offline_langfuse(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep `langfuse_io.is_configured()` false for every test.
+
+    Importing LiteLLM (which `resolve_model` does for any non-OpenAI model)
+    calls `load_dotenv()` as a side effect, so the repo's .env lands in
+    os.environ partway through the session and stays there. With LANGFUSE_*
+    set, helpers such as `scale.load_store_traces` take the live path and try
+    to reach the local Langfuse, which makes later tests fail depending on
+    which tests ran before them. Clearing the trio per test pins every test to
+    the committed analysis/state JSON. Tests that exercise tracing set their own
+    placeholder values with monkeypatch inside the test body.
+    """
+    for name in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_HOST"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(scope="session")
 def world(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
     root = tmp_path_factory.mktemp("world")

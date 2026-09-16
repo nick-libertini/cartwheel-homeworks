@@ -421,6 +421,14 @@ def find_order(
     return _call(wrapper, hw_tools.find_order, query)
 
 
+@function_tool
+def check_return_eligibility(
+    wrapper: RunContextWrapper[AuthContext], order_id: int
+) -> dict[str, Any]:
+    """Check an order's return deadline: the window, the dates, and days remaining."""
+    return _call(wrapper, hw_tools.check_return_eligibility, order_id)
+
+
 # Progressive disclosure: a session exposes only the tools its role can use.
 # Fewer tools mean fewer wrong choices and cleaner evals. At dev scale the
 # only difference is that support staff, who have no orders of their own,
@@ -430,6 +438,7 @@ _COMMON_TOOLS = [
     get_policy,
     search_products,
     get_order,
+    check_return_eligibility,
     issue_refund,
     cancel_order,
     escalate_to_human,
